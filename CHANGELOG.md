@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add strict exact-key Chromium local-storage reads with manifest, checksum, and file-change validation and descriptor-anchored symlink protection for credential discovery. (#25, thanks @OttoPrua)
 - Fix Chromium local-storage current-record selection using LevelDB sequences and live manifest files, preserving sign-in values after older deletions and excluding stale tokens from text and token scans. (steipete/CodexBar#3536)
 - Add Ego Lite browser discovery and encrypted-cookie imports through the shared Chromium reader. (#23, thanks @apple-ouyang)
 

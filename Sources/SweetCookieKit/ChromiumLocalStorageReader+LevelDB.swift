@@ -5,6 +5,8 @@ import Foundation
 extension ChromiumLocalStorageReader {
     /// Exact raw-key read for credential discovery. Never falls back to orphan-file scanning.
     /// Rejects incomplete/checksum-invalid reads and observable file changes; this is not a transaction.
+    /// Returns the stored bytes without decoding, or nil for an absent/deleted key or a rejected read.
+    /// Requires a physical directory path without symlink components; bypasses the shared memo.
     public static func readCurrentValue(forRawKey key: Data, in directory: URL) -> Data? {
         guard !key.isEmpty, let files = ChromiumAnchoredFiles(directory: directory) else { return nil }
         let cache = LevelDBReadCache(strictReads: true, readData: { try files.read($0) })
@@ -281,14 +283,16 @@ extension ChromiumLocalStorageReader {
         guard let indexBlock = self.readBlock(
             data: data, handle: indexHandle, strict: cache.strictReads, logger: logger)
         else { complete = false; return [] }
-        let indexEntries = self.parseDataBlock(indexBlock, treatKeysAsInternal: false, complete: &complete)
+        let indexEntries = self.parseDataBlock(
+            indexBlock, treatKeysAsInternal: false, strict: cache.strictReads, complete: &complete)
         var results: [LevelDBEntry] = []
 
         for entry in indexEntries {
             guard let handle = self.decodeBlockHandle(from: entry.value) else { complete = false; continue }
             guard let blockData = self.readBlock(data: data, handle: handle, strict: cache.strictReads, logger: logger)
             else { complete = false; continue }
-            let dataEntries = self.parseDataBlock(blockData, treatKeysAsInternal: true, complete: &complete)
+            let dataEntries = self.parseDataBlock(
+                blockData, treatKeysAsInternal: true, strict: cache.strictReads, complete: &complete)
             results.append(contentsOf: dataEntries)
         }
         return results
@@ -325,6 +329,7 @@ extension ChromiumLocalStorageReader {
     private static func parseDataBlock(
         _ data: Data,
         treatKeysAsInternal: Bool,
+        strict: Bool,
         complete: inout Bool) -> [LevelDBEntry]
     {
         guard data.count >= 4 else { complete = false; return [] }
@@ -332,15 +337,31 @@ extension ChromiumLocalStorageReader {
         let restartArraySize = (restartCount + 1) * 4
         guard data.count >= restartArraySize else { complete = false; return [] }
         let limit = data.count - restartArraySize
+        if strict {
+            guard restartCount > 0, self.readUInt32LE(data, at: limit) == 0,
+                  limit > 0 || restartCount == 1 else { complete = false; return [] }
+        }
 
         var entries: [LevelDBEntry] = []
         var offset = 0
+        var restartIndex = 0
         var lastKey = Data()
         while offset < limit {
+            let entryOffset = offset
             guard let shared = self.readVarint32(data, at: &offset),
                   let nonShared = self.readVarint32(data, at: &offset),
                   let valueLength = self.readVarint32(data, at: &offset)
             else { complete = false; break }
+
+            // Restart offsets must name unshared entry boundaries, never bytes hiding newer records.
+            if strict, restartIndex < restartCount {
+                let restart = Int(self.readUInt32LE(data, at: limit + restartIndex * 4))
+                guard restart >= entryOffset else { complete = false; break }
+                if restart == entryOffset {
+                    guard shared == 0 else { complete = false; break }
+                    restartIndex += 1
+                }
+            }
 
             let keyEnd = offset + Int(nonShared)
             guard keyEnd <= limit else { complete = false; break }
@@ -369,6 +390,9 @@ extension ChromiumLocalStorageReader {
             } else {
                 entries.append(LevelDBEntry(key: fullKey, value: value, isDeletion: false, sequence: 0))
             }
+        }
+        if strict, limit > 0, restartIndex != restartCount {
+            complete = false
         }
         return entries
     }

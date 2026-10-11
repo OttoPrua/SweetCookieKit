@@ -6,6 +6,7 @@ import Darwin
 extension ChromiumLocalStorageReader {
     enum StrictReadEvent: Sendable {
         case willOpen(String)
+        case didOpen(String)
         case didRead(String)
     }
 
@@ -112,6 +113,7 @@ final class ChromiumAnchoredFiles: @unchecked Sendable {
         guard fstat(file, &before) == 0, before.st_mode & S_IFMT == S_IFREG,
               Stamp(before) == expected, before.st_size >= 0, before.st_size <= 64 * 1024 * 1024
         else { throw CocoaError(.fileReadCorruptFile) }
+        ChromiumLocalStorageReader.strictReadObserver?(.didOpen(name))
         var data = Data(count: Int(before.st_size))
         let complete = data.withUnsafeMutableBytes { buffer -> Bool in
             var offset = 0

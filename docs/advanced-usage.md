@@ -95,6 +95,21 @@ let tokens = ChromiumLevelDBReader.readTokenCandidates(
 
 These helpers read local storage; they do not modify or persist browser data.
 
+### Strict credential reads
+
+For credential discovery on macOS, use one exact raw LevelDB user key:
+
+```swift
+let rawKey = Data("_https://example.com\0".utf8) + Data([1]) + Data("access_token".utf8)
+let rawValue = ChromiumLocalStorageReader.readCurrentValue(forRawKey: rawKey, in: levelDBURL)
+```
+
+The result contains the stored bytes, including Chromium's encoding prefix. Matching is byte-for-byte, without origin normalization or token scanning. The reader requires `CURRENT`, a valid manifest, and all referenced live tables and required recovery logs. It checks record/block checksums and sequence conflicts before selecting the current value; missing or deleted keys and rejected reads all return `nil`. It never falls back to orphan-file scanning or the shared memo.
+
+Supply a physical file URL with no symlinked directory components. Directory descriptors anchor `openat`/`O_NOFOLLOW` file opens and `pread` reads; symlinked files, files over 64 MiB, and observable replacement or mutation are rejected. This is still a live read, not a transactional snapshot: changes after the final check and rename/restore races cannot all be excluded.
+
+### Best-effort reads and caching
+
 All three readers select the highest LevelDB sequence for each raw user key before decoding or scanning. Write-batch operations advance the batch's sequence; `.ldb` and `.sst` records use their internal-key sequence and value type. A newer deletion hides an older value, while a newer value survives an older deletion. File modification times do not determine which value is current. Text and token scans exclude replaced and deleted records.
 
 When `CURRENT` is present, the reader replays its manifest to select live tables and recoverable logs, excluding obsolete tables and logs left after compaction. Without `CURRENT`, it scans all `.log`, `.ldb`, and `.sst` files using the same sequence ordering; this fallback cannot identify obsolete files whose records have no newer counterpart. An unreadable or malformed current manifest yields no entries rather than guessing which files are live. Reads remain best effort against a running browser, without a transactional snapshot or full LevelDB checksum validation.

@@ -24,6 +24,10 @@ struct ChromiumStrictCurrentValueTests {
         #expect(self.read(fixture) == Data([1]) + Data("new".utf8))
         try fixture.write("000004.log", data: fixture.batch(sequence: 31, values: [nil, "new", nil]))
         #expect(self.read(fixture) == nil)
+        try fixture.write("000003.ldb", data: fixture.table(sequence: 34, values: ["restored"], snappy: snappy))
+        #expect(self.read(fixture) == Data([1]) + Data("restored".utf8))
+        try fixture.write("000003.ldb", data: fixture.table(sequence: 35, values: [nil], snappy: snappy))
+        #expect(self.read(fixture) == nil)
     }
 
     @Test(arguments: [
@@ -81,13 +85,19 @@ struct ChromiumStrictCurrentValueTests {
         #expect(self.read(fixture) == Data([1]) + Data("new".utf8))
     }
 
-    @Test(arguments: ["http://example.com", "https://example.com:443", "https://sub.example.com"])
-    func `exact raw origin does not use host matching`(origin: String) throws {
+    @Test(arguments: [
+        ("http://example.com", "access_token"),
+        ("https://example.com:443", "access_token"),
+        ("https://sub.example.com", "access_token"),
+        ("https://example.com", "access_token_extra"),
+        ("https://example.com", "access"),
+    ])
+    func `raw key matching is exact`(origin: String, key: String) throws {
         let fixture = try SyntheticLevelDB()
         defer { fixture.remove() }
         try self.manifest(fixture)
         try fixture.write("000004.log", data: fixture.batch(sequence: 1, values: ["synthetic"]))
-        let wrongKey = Data("_\(origin)\0".utf8) + Data([1]) + Data("access_token".utf8)
+        let wrongKey = Data("_\(origin)\0".utf8) + Data([1]) + Data(key.utf8)
         #expect(ChromiumLocalStorageReader.readCurrentValue(forRawKey: wrongKey, in: fixture.directory) == nil)
         #expect(self.read(fixture) != nil)
         if origin == "http://example.com" {
@@ -112,8 +122,8 @@ struct ChromiumStrictCurrentValueTests {
         }
     }
 
-    @Test(arguments: ["CURRENT", "MANIFEST-000001", "000004.log"])
-    func `symlink replacement never reads the replacement`(name: String) throws {
+    @Test(arguments: ["CURRENT", "MANIFEST-000001", "000004.log"], [false, true])
+    func `symlink replacement never reads the replacement`(name: String, afterOpen: Bool) throws {
         let fixture = try SyntheticLevelDB()
         let other = try SyntheticLevelDB()
         defer { fixture.remove(); other.remove() }
@@ -122,7 +132,8 @@ struct ChromiumStrictCurrentValueTests {
         try other.write(name, data: Data("outside must not be read".utf8))
         let observer: @Sendable (ChromiumLocalStorageReader.StrictReadEvent) -> Void = { event in
             switch event {
-            case let .willOpen(opened) where opened == name:
+            case let .willOpen(opened) where opened == name && !afterOpen,
+                 let .didOpen(opened) where opened == name && afterOpen:
                 do {
                     let url = fixture.directory.appendingPathComponent(name)
                     try FileManager.default.removeItem(at: url)
@@ -194,23 +205,69 @@ struct ChromiumStrictCurrentValueTests {
         #expect(!files.unchanged())
     }
 
-    @Test(arguments: ["directory", "log"])
+    @Test(arguments: ["directory", "parent", "log"])
     func `symlinks fail closed`(kind: String) throws {
         let fixture = try SyntheticLevelDB()
         let other = try SyntheticLevelDB()
         defer { fixture.remove(); other.remove() }
         try self.manifest(fixture)
         try fixture.write("000004.log", data: fixture.batch(sequence: 1, values: ["value"]))
-        let link = other.directory.appendingPathComponent(kind == "directory" ? "linked" : "data")
-        if kind == "directory" {
-            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: fixture.directory)
-            #expect(ChromiumLocalStorageReader.readCurrentValue(forRawKey: fixture.key, in: link) == nil)
+        let link = other.directory.appendingPathComponent("linked")
+        if kind != "log" {
+            let target = kind == "parent" ? fixture.directory.deletingLastPathComponent() : fixture.directory
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+            let directory = kind == "parent" ? link.appendingPathComponent(fixture.directory.lastPathComponent) : link
+            #expect(ChromiumLocalStorageReader.readCurrentValue(forRawKey: fixture.key, in: directory) == nil)
         } else {
             let log = fixture.directory.appendingPathComponent("000004.log")
             try FileManager.default.moveItem(at: log, to: link)
             try FileManager.default.createSymbolicLink(at: log, withDestinationURL: link)
             #expect(self.read(fixture) == nil)
         }
+    }
+
+    @Test(arguments: ["000003.ldb", "000003.sst", "000004.log", "MANIFEST-000001"])
+    func `truncated live files never return an older credential`(name: String) throws {
+        let fixture = try SyntheticLevelDB()
+        defer { fixture.remove() }
+        try self.manifest(fixture, tables: [3])
+        let tableName = name.hasSuffix("sst") ? "000003.sst" : "000003.ldb"
+        try fixture.write(tableName, data: fixture.table(sequence: 30, values: ["old"], snappy: true))
+        try fixture.write("000004.log", data: fixture.batch(sequence: 31, values: ["new"]))
+        let data = try Data(contentsOf: fixture.directory.appendingPathComponent(name))
+        for length in 1..<data.count {
+            try fixture.write(name, data: Data(data.prefix(length)))
+            #expect(self.read(fixture) == nil, "Truncated \(name) at \(length) bytes")
+        }
+    }
+
+    @Test func `checksum valid malformed batch fails closed`() throws {
+        let fixture = try SyntheticLevelDB()
+        defer { fixture.remove() }
+        try self.manifest(fixture, tables: [3])
+        try fixture.write("000003.ldb", data: fixture.table(sequence: 30, values: ["old"]))
+        let malformed = fixture.littleEndian(UInt64(31)) + fixture.littleEndian(UInt32.max) + Data([1, 0xFF])
+        try fixture.write("000004.log", data: fixture.record(malformed))
+        #expect(self.read(fixture) == nil)
+    }
+
+    @Test func `malformed restart array cannot hide newer tombstones`() throws {
+        let fixture = try SyntheticLevelDB()
+        defer { fixture.remove() }
+        try self.manifest(fixture, tables: [3])
+        try fixture.write("000004.log", data: fixture.batch(sequence: 1, values: ["old"]))
+        var table = fixture.table(sequence: 30, values: [nil, nil, nil, nil])
+        // Four unshared internal keys make the synthetic data block four-byte aligned.
+        let blockLength = 4 * (3 + fixture.key.count + 8) + 8
+        try #require(blockLength.isMultiple(of: 4))
+        table.replaceSubrange(
+            (blockLength - 4)..<blockLength,
+            with: fixture.littleEndian(UInt32(blockLength / 4 - 1)))
+        table.replaceSubrange(
+            (blockLength + 1)..<(blockLength + 5),
+            with: fixture.checksum(Data(table.prefix(blockLength + 1))))
+        try fixture.write("000003.ldb", data: table)
+        #expect(self.read(fixture) == nil)
     }
 
     private func read(_ fixture: SyntheticLevelDB) -> Data? {
